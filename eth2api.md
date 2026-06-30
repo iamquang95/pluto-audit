@@ -1,0 +1,117 @@
+# Audit: eth2api  (7130 LOC) — STATUS: VERIFIED
+
+- **Pluto:** `crates/eth2api/src/*` (beacon_node, v1, versioned, valcache, validator_duty, spec, extensions)
+- **Charon:** `app/eth2wrap/*.go` (eth2wrap, multi, lazy, success, synthproposer, valcache, httpwrap)
+- **Tier B** · model: **sonnet** · READ-ONLY (no source edits, no builds)
+- **How to run:** use the agent prompt + output schema in `shared/audit/README.md`; overall process in `.plans/repo-audit.md`.
+
+## Module map (pluto ↔ charon)
+- `beacon_node.rs`/`v1.rs`/`versioned.rs` ↔ `app/eth2wrap/{eth2wrap,httpwrap}.go`
+- `valcache.rs` ↔ `app/eth2wrap/valcache.go`
+- multi/fallback + synthproposer ↔ `app/eth2wrap/{multi,lazy,success,synthproposer}.go`
+
+## Crate-specific focus
+- **Parity:** beacon-node client endpoint coverage, versioned (fork) type handling, valcache semantics, multi-client fallback + success policy, synthetic-proposer behavior, retry.
+- **Security:** response size limits, TLS, validation of untrusted beacon responses.
+- **Quality:** async client, cache invalidation, error transparency.
+
+Note on scope: `client.rs` (1.9K LOC) and `types.rs` (9K LOC) are `oas3-gen`-generated (counterpart: charon's generated `eth2wrap_gen.go`); the hand-written, parity-critical logic is in `extensions.rs`, `valcache.rs`, `versioned.rs`, `validator_duty.rs`, `beacon_node.rs`, `spec/version.rs`. Multi-client fallback / `success` policy / lazy-connect and the synthetic-proposer *cache+shuffle* are NOT in this crate (only the `SYNTHETIC_GRAFFITI` marker + `is_synthetic()` graffiti check live here); those orchestration units belong to other crates and are out of scope for this file.
+
+---
+## Findings
+
+### [High] Validator cache never invalidated in production — serves stale validators across epochs
+- **Rust:** `crates/eth2api/src/valcache.rs:114` (`ValidatorCache::trim`), `crates/eth2api/src/valcache.rs:123` (`get_by_head`); only caller is the test at `valcache.rs:325`; populated in prod at `crates/core/src/scheduler.rs:674`
+- **Charon ref:** [`app/eth2wrap/valcache.go:70`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/eth2wrap/valcache.go#L70) (`Trim`), wired on epoch boundary at [`app/app.go:520`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/app.go#L520) (`valCache.Trim()`)
+- **Issue:** Charon calls `ValidatorCache.Trim()` every epoch boundary so the next `GetByHead` re-fetches. In pluto `trim()` exists but has no production caller (grep across `core/`, `app/`, `cli/` finds only the unit test). `get_by_head` caches `active`/`complete` and returns them forever once set; `get_by_slot` (which always refetches) is never used in prod. Result: validator set/status (active↔exited, new activations, slashings, balances) is frozen at first fetch for the process lifetime.
+- **Impact & likelihood:** Validators that activate/exit/get slashed after first fetch are mis-classified → wrong duty scheduling, wrong active-validator set fed to attester-duty resolution and validatorapi. Always, on any epoch where validator membership/status changes (routine on mainnet).
+- **PoC:** CONFIRMED — inspection (no PoC test needed). Grepped all crates: the ONLY callers of `trim()`/`set_validator_cache`/`ValidatorCache::new` are tests (`bcast/mod.rs:874` is inside `#[cfg(test)] mod tests` at `:795`; `beacon_node.rs:107` is a test). Prod path: `scheduler.rs:674` calls `get_by_head()` only; charon's per-slot refresh loop (`app.go:500-532` → `valCache.Trim()` + `GetBySlot`) has no pluto counterpart. WORSE than reported: prod `BeaconNodeClient::new` (`beacon_node.rs:34`) builds the cache with **empty pubkeys** (`Vec::new()`) and nothing ever replaces it with the real key set, so on top of never being trimmed it isn't even populated with the cluster's pubkeys in prod. Severity unchanged (High).
+- **Fix:** Wire `valcache.trim()` into the scheduler's epoch-boundary handler (mirror `app.go:520`), or switch the head path to `get_by_slot` per-slot refresh as charon's `GetBySlot` does, and ensure the cache is constructed with the real cluster pubkeys (not `Vec::new()`). The eth2api crate change is to ensure `trim` is reachable/used; the missing call is in `core/scheduler`.
+
+### [High] EIP-7044 voluntary-exit domain uses beacon-node-reported Capella version, not charon's canonical per-network table
+- **Rust:** `crates/eth2api/src/extensions.rs:227` (`resolve_domain`), lines 235–243; reads `fork_schedule.get(Capella).version` (from BN `/eth/v1/config/spec`), falling back to `genesis_fork_version`
+- **Charon ref:** [`app/eth2wrap/httpwrap.go:122`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/eth2wrap/httpwrap.go#L122) (`httpAdapter.Domain`) → [`eth2util/helper_capella.go:103`](https://github.com/ObolNetwork/charon/blob/v1.7.1/eth2util/helper_capella.go#L103) (`CapellaDomain`) → `helper_capella.go:20` (`CapellaFork`) using the hard-coded `supportedNetworks` table in [`eth2util/network.go:38`](https://github.com/ObolNetwork/charon/blob/v1.7.1/eth2util/network.go#L38) (keyed by genesis fork version; e.g. Sepolia genesis `0x90000069` → Capella `0x90000072`)
+- **Issue:** Charon deliberately derives the Capella fork version for the exit signing domain from its own trusted network table keyed by the genesis fork version — it does NOT trust the beacon node's reported `CAPELLA_FORK_VERSION`. Pluto trusts `CAPELLA_FORK_VERSION` from the BN spec response, and on the fallback path (Capella absent from schedule) uses `genesis_fork_version`, which is wrong for every network whose Capella version differs from genesis (all of them — Capella version is `0x03…`/`0x04…`/`0x90000072`, never the genesis value).
+- **Impact & likelihood:** A misconfigured/malicious BN that misreports `CAPELLA_FORK_VERSION` (or omits it, triggering the genesis fallback) yields a wrong exit signing domain → invalid voluntary-exit signatures (exit never processed) or, worse, a signature valid under an unintended domain. On a correct mainnet BN with Capella present, results match; divergence triggers on the fallback path or any non-conforming BN.
+- **PoC:** CONFIRMED — scratch test `scratch_eip7044_divergence` (extensions.rs, exercising `resolve_domain` with the exit domain type) → PASS, proving: (a) when the BN reports a wrong Capella version (e.g. `0xdeadbeef`) pluto computes the domain from that value, NOT the canonical one; (b) when Capella is absent from the schedule, pluto falls back to `genesis_fork_version` and the resulting domain differs from the canonical Capella domain on a network where Capella≠genesis (modeled on Sepolia: genesis `0x90000069` vs Capella `0x90000072`). Charon-side reasoned (Go not run): `httpwrap.go:124` calls `CapellaDomain(ctx, "0x"+hex(h.forkVersion))` where `forkVersion` is the *genesis* fork version, and `helper_capella.go:77` `CapellaFork` maps it to the hard-coded `network.go:38` `supportedNetworks` Capella value — the BN-reported `CAPELLA_FORK_VERSION` is never consulted, and an unknown genesis version is a hard error (`network.go:30`), not a fallback. Divergence confirmed. Severity unchanged (High); see Uncertain note re product decision.
+- **Fix:** Port charon's network table: map genesis fork version → Capella hard-fork version (`eth2util/network.go`) and compute the exit domain from that table rather than the BN-reported `CAPELLA_FORK_VERSION`/genesis fallback. At minimum, treat a missing Capella schedule entry as an error rather than silently falling back to `genesis_fork_version`.
+
+### [Medium] No request timeout and no response size limit on the HTTP client (DoS surface)
+- **Rust:** `crates/eth2api/src/client.rs:54` and `:62` (`Client::builder().build()` with no `.timeout(...)`); response bodies read via generated `parse_response`→`.json()`/`.bytes()` (e.g. `types.rs:691`) with no cap; SSE `event_stream` at `extensions.rs:425` also untimed/uncapped
+- **Charon ref:** [`app/eth2wrap/httpwrap.go:33`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/eth2wrap/httpwrap.go#L33) (`newHTTPAdapter` carries a `timeout`), `:95` (`Validators` scales the per-request timeout: `>200` validators → `50ms * n`); go-eth2-client enforces per-call timeouts throughout
+- **Issue:** reqwest client is built with default config: no overall/connect/read timeout, no `Content-Length`/body-size ceiling. A slow or hostile beacon node (or MITM) can stall a request indefinitely or stream an unbounded body, exhausting memory/blocking duty tasks. Charon both sets a base timeout and exponentially scales it for large validator-set queries; neither the base timeout nor the `>200` scaling is ported.
+- **Impact & likelihood:** Hung duty flows / OOM under a malicious or degraded BN; large-cluster `get_by_head`/`get_by_slot` POSTs may also time out spuriously elsewhere if a default is later added without the scaling. Likely on adversarial/degraded BN or crowded testnets; the missing timeout is unconditional.
+- **PoC:** CONFIRMED — inspection of the (now-generated) `client.rs`: all three constructors build reqwest with no timeout — `new()` `:55` `Client::builder().build().expect("client")`, `with_base_url()` `:62` `Client::builder().build()`, and `with_client()` `:67` accepts a caller-supplied client (no prod caller passes a timeout-configured one). Every request method calls `.send()` untimed and reads the body via `<Req>::parse_response` → `req.bytes().await?` / `.json()` (`types.rs:691,832,...`) with no `content_length` check or capped read. SSE `event_stream` (`extensions.rs:425`) is also untimed/uncapped. The charon `>200`-validator timeout scaling (`httpwrap.go:95`) is not ported. Severity unchanged (Medium).
+- **Fix:** Configure `reqwest::Client::builder().timeout(...)` (and connect timeout) at construction; bound response size (check `content_length`, or read with a capped reader) for JSON/SSZ bodies. Port the `>200`-validator timeout scaling for the validators POST in `valcache.rs`.
+
+### [Low] valcache drops charon's nil/inconsistent-validator guard
+- **Rust:** `crates/eth2api/src/valcache.rs:210` (`validators_from_response`)
+- **Charon ref:** [`app/eth2wrap/valcache.go:122`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/eth2wrap/valcache.go#L122) and `:169` (`if val == nil || val.Validator == nil { return errors.New("validator data cannot be nil") }`)
+- **Issue:** Charon explicitly errors if any returned validator entry (or its inner `Validator`) is nil before populating the cache. Pluto deserializes into `GetStateValidatorsResponseResponseDatum` (non-optional `validator` field) and never asserts the BN returned an entry for each requested pubkey, nor guards against a malformed/empty inner object beyond what serde enforces. Behavior on a partial/garbage response differs from charon's hard error: serde may fill defaults or the entry is silently absent from the active/complete maps.
+- **Impact & likelihood:** A BN returning incomplete validator data is silently accepted (validator missing from the active set, or with default-zeroed fields) instead of surfacing an error → silent under-counting of active validators. Only on malformed/partial BN responses.
+- **PoC:** REFINED — scratch test `scratch_partial_response_silently_accepted` (valcache.rs): requested 3 pubkeys, BN returned 1 → `get_by_head()` returns Ok with `active.len()==1`, `complete.len()==1` (the 2 missing validators are silently dropped, no error). Confirms the divergence from charon's hard error — but the *exact* charon guard (`valcache.go:123` `if val == nil || val.Validator == nil`) cannot be reproduced in Rust: `GetStateValidatorsResponseResponseDatum.validator` is a non-`Option` field, so serde rejects a missing/`null` inner validator at deserialization (cannot be silently default-zeroed). The real, reproducible gap is the absence of a *coverage* check (response must cover the requested pubkey set), which charon's loop does not enforce either — so this is a missing pluto-side hardening rather than a strict charon-parity miss. Severity lowered to Low and reframed from "dropped nil guard" to "no requested-coverage check"; serde already prevents the nil-inner case.
+- **Fix:** After parsing, verify the response covers the requested pubkey set (or at least reject entries with zeroed/invalid pubkeys), mirroring charon's explicit nil guard with a clear error rather than relying on serde defaults.
+
+### [Info] Not a finding as written: `compute_domain` indexes fixed-size arrays with current type-level length guarantees
+- **Rust:** `crates/eth2api/src/extensions.rs:161` (`compute_domain`), lines 173–175 (`domain[..DOMAIN_TYPE_LEN].copy_from_slice(&domain_type)` and `fork_data_root.0[..(DOMAIN_LEN - DOMAIN_TYPE_LEN)]`)
+- **Charon ref:** [`eth2util/helper_capella.go:94-99`](https://github.com/ObolNetwork/charon/blob/v1.7.1/eth2util/helper_capella.go#L94-L99) (`ComputeDomain`: `append(domain, domainType[:]...); append(domain, fdt[:28]...)`)
+- **Issue:** Correctness depends on `DOMAIN_TYPE_LEN == 4`, `DOMAIN_LEN == 32`, and `Root` being 32 bytes. These are compile-time constants/array types so the slices are in-bounds, but there is no `const` assertion or comment pinning `DOMAIN_LEN - DOMAIN_TYPE_LEN == 28` against `tree_hash_root` width; a future constant edit would panic at runtime rather than fail to compile. Charon hardcodes `fdt[:28]`.
+- **Impact & likelihood:** Panic (slice-out-of-range) if the domain constants are ever changed inconsistently; not reachable with current constants. Negligibly rare today; latent maintenance hazard.
+- **PoC:** n/a
+- **Fix:** Add a `const`-assert (or static check) that `DOMAIN_TYPE_LEN + (DOMAIN_LEN - DOMAIN_TYPE_LEN) == 32` and that `Root` is 32 bytes, and a comment documenting the invariant.
+
+### [Low] Electra committee index taken as first set bit, ignoring multi-bit `committee_bits`
+- **Rust:** `crates/eth2api/src/validator_duty.rs:349` (`attestations_request_body`, `first_set_bit(&attestation.committee_bits.bytes)`), helper at `:659`
+- **Charon ref:** [`core/validatorapi/validatorapi.go:284`](https://github.com/ObolNetwork/charon/blob/v1.7.1/core/validatorapi/validatorapi.go#L284) (`att.CommitteeIndex()`); go-eth2-client `VersionedAttestation.CommitteeIndex()` requires exactly one bit set and errors otherwise
+- **Issue:** For Electra single-attestation submission, pluto picks the first set bit of `committee_bits` and ignores any additional bits. go-eth2-client's `CommitteeIndex()` treats more-than-one set bit as an error. A SingleAttestation should have exactly one committee bit; pluto silently accepts a malformed multi-bit value and submits the lowest index.
+- **Impact & likelihood:** A malformed/aggregated attestation reaching this path is silently coerced rather than rejected. Only on malformed input (shouldn't occur for correctly-built single attestations).
+- **PoC:** n/a
+- **Fix:** Require exactly one set bit in `committee_bits` (error if zero or >1), matching go-eth2-client `CommitteeIndex()`.
+
+### [Low] `submit_attestations`/`submit_aggregate_attestations` infer Electra-vs-pre-Electra wire shape from only the first element
+- **Rust:** `crates/eth2api/src/validator_duty.rs:328` (`attestations_request_body`) and `:542` (`aggregate_and_proofs_request_body`) — both branch on `attestations.first()` / `aggregate_and_proofs.first()`
+- **Charon ref:** `app/eth2wrap/eth2wrap.go` / go-eth2-client submit paths (per-batch version derived from the versioned wrapper)
+- **Issue:** The request wire shape (Array vs Array2) and the `eth_consensus_version` header are derived solely from the first item's version. A mixed-version batch (first pre-Electra, rest Electra or vice-versa) would be encoded under the wrong shape; the per-item `match` then errors ("electra payload in pre-electra request") — so it fails loudly rather than mis-encoding, but the header/shape selection assumes homogeneity without asserting it.
+- **Impact & likelihood:** Mixed-version batch → error instead of correct handling; benign for the single-version batches the duty flow actually produces. Only on (unexpected) mixed batches.
+- **PoC:** n/a
+- **Fix:** Assert all items share the same version (or group by version), and document the homogeneity contract.
+
+### [Low] `submit_signed_blinded_proposal` matches the wrong response enum variants for success
+- **Rust:** `crates/eth2api/src/validator_duty.rs:176` (`submit_signed_blinded_proposal`) matches `crate::PublishBlockV2Response::Ok | Accepted`
+- **Charon ref:** [`app/eth2wrap/synthproposer.go:212`](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/eth2wrap/synthproposer.go#L212) (`SubmitBlindedProposal`); generated client `publish_blinded_block_v2` returns `PublishBlockV2Response` (`client.rs:1581`)
+- **Issue:** Functionally correct because the generated `publish_blinded_block_v2` reuses the `PublishBlockV2Response` type (`client.rs:1584`), so the variants line up. Worth flagging only as a readability/coupling smell: a blinded-block submitter matching on a type named for the unblinded endpoint is fragile if the generator later gives blinded blocks their own response type.
+- **Impact & likelihood:** None today; latent breakage if generated types diverge. Negligible.
+- **PoC:** n/a
+- **Fix:** None required; optionally add a comment that blinded/unblinded share `PublishBlockV2Response`.
+
+### [Low] `fetch_domain` performs redundant sequential round-trips to the beacon node
+- **Rust:** `crates/eth2api/src/extensions.rs:372` (`fetch_domain`): one `/config/spec` (`fetch_spec_data`) + one `/beacon/genesis` (`fetch_genesis_data`) + spec re-parse for `DOMAIN_VOLUNTARY_EXIT` per call; `fetch_beacon_attester_domain` (`validator_duty.rs:74`) calls `fetch_domain_type` (another `/config/spec`) then `fetch_domain` (spec again + genesis) → up to 3 spec/genesis fetches for one attester domain
+- **Charon ref:** go-eth2-client caches spec/genesis/fork-schedule internally; `httpAdapter.Domain` reuses cached spec/genesis
+- **Issue:** Spec and genesis are effectively immutable for the process lifetime but are re-fetched on every domain computation. `fetch_beacon_attester_domain` fetches the spec twice (once for the domain type, once inside `fetch_domain`) plus genesis. No caching layer exists in this crate.
+- **Impact & likelihood:** Extra BN load and latency on the signing hot path; not incorrect. Always, but low magnitude.
+- **PoC:** n/a
+- **Fix:** Cache spec/genesis/fork-schedule once (immutable post-genesis) and reuse, mirroring go-eth2-client; at least pass the already-fetched spec into the domain-type lookup to avoid the double spec fetch in `fetch_beacon_attester_domain`.
+
+### [Info] `EthBeaconNodeApiClient::new()` panics on a placeholder base URL
+- **Rust:** `crates/eth2api/src/client.rs:53` (`new`): `Url::parse(BASE_URL)` where `BASE_URL = "{server_url}"` (`client.rs:38`), and `Client::builder().build().expect("client")`
+- **Charon ref:** n/a (generated-code artifact)
+- **Issue:** Generated `new()` parses the literal template `"{server_url}"` which is not a valid URL; `Url::parse` returns `Err` and `.expect("valid base url")` panics. Pluto always uses `with_base_url`/`with_client` (e.g. `beacon_node.rs`, tests), so `new()` is dead/footgun API that will panic if ever called.
+- **Impact & likelihood:** Panic only if a caller invokes the parameterless `new()`/`Default`. Not used in pluto.
+- **PoC:** n/a
+- **Fix:** Remove the `Default`/`new()` impls from the generated surface (or have the generator omit a server-templated `BASE_URL`), forcing construction through `with_base_url`.
+
+### [Info] Untrusted beacon JSON fields parsed without range/semantic validation beyond type
+- **Rust:** `crates/eth2api/src/extensions.rs:93` (`parse_u64_field`), `:102` (`decode_fixed_hex`), `:114` (`parse_genesis_fork_version_and_validators_root`); `valcache.rs:217` (index parse), `:246` (`parse_pubkey`)
+- **Charon ref:** go-eth2-client typed unmarshalling
+- **Issue:** Hex/decimal fields from the (untrusted) BN are decoded with correct length checks and parse-error handling (good), but there is no semantic validation (e.g. `SECONDS_PER_SLOT`/`SLOTS_PER_EPOCH` only checked for zero in `fetch_slots_config:311`, not sanity-bounded; fork epochs accepted up to `u64::MAX`). This matches charon's general trust model (BN is semi-trusted) so it is informational, but worth noting for the threat model: a hostile BN can supply absurd-but-well-typed spec values that propagate into slot/epoch math elsewhere.
+- **Impact & likelihood:** Downstream arithmetic on adversarial spec values (overflow/odd scheduling) — depends on consumers; in-crate parsing itself is safe. Only on hostile BN.
+- **PoC:** n/a
+- **Fix:** If the threat model includes hostile BNs, add sanity bounds on critical spec constants at fetch time; otherwise document that the BN is trusted for spec correctness.
+
+## Uncertain / needs-human
+- **Capella-table parity (High #2):** Confirm whether pluto intends to trust the BN's `CAPELLA_FORK_VERSION` (simpler, current behavior) or replicate charon's hard-coded `supportedNetworks` table. If pluto's product decision is "trust the BN spec", downgrade to Low and document the deliberate divergence; the security-relevant part (genesis-version fallback producing a wrong domain on networks where Capella≠genesis) still stands.
+- **Cache invalidation (High #1):** The missing `valcache.trim()` caller is in `core/scheduler`, not this crate. Verify there is no other invalidation mechanism (e.g. a fresh `ValidatorCache` constructed per epoch by `set_validator_cache`) before finalizing severity; grep found `set_validator_cache` only in tests, suggesting none. Owner: whoever audits `core/scheduler`.
+- **go-eth2-client `CommitteeIndex()` exact semantics (Low):** Not vendored locally; confirmed by reasoning that a SingleAttestation must have exactly one committee bit. A Phase-2 check against the actual go-eth2-client source would firm up the "first vs only set bit" claim.
+
+## Summary
+eth2api's generated client/types (`client.rs`, `types.rs`) mirror charon's generated `eth2wrap_gen.go` and look faithful; risk concentrates in the hand-written glue. Two High-severity parity gaps dominate: (1) the validator cache is never invalidated in production (`trim()` has only a test caller vs charon's per-epoch `app.go` trim), freezing validator status across epochs; (2) the EIP-7044 voluntary-exit domain trusts the BN-reported Capella version with a genesis-version fallback, instead of charon's hard-coded per-network Capella table. Medium issue: no HTTP request timeout / response-size limit (charon sets timeouts and scales them for large validator queries). The valcache nil-guard item is Low after triage because serde prevents null inner validators; `compute_domain` length indexing is Info/not-a-finding as written under current array constants. Remaining items are Low/Info (committee-index first-bit coercion, redundant spec/genesis round-trips, panicking generated `new()`).
