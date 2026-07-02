@@ -91,3 +91,20 @@ Core-parsig is a faithful, well-structured port. No memory-safety, crypto-correc
 - **aggsigdb v2 selection:** RESOLVED in Phase 2 — `AggSigDBV2` is `statusAlpha` and disabled by default in v1.7.1 (`minStatus = statusStable`), so the production-default impl is `NewMemDB` (V1), which pluto's actor model matches. Finding downgraded to Info. No human action needed.
 - **PartialEq vs JSON-equality (parsigdb & aggsigdb):** PARTIALLY RESOLVED in Phase 2 — for the only custom-serde `SignedData` impl (`VersionedAttestation`) struct-eq empirically agreed with JSON-bytes-eq across tested pairs, and all other impls are derive-PartialEq + standard-serde (so equivalence holds). Both findings downgraded Medium→Low. The cross-check was representative, not exhaustive over every impl — a human/maintainer confirming every `SignedData` impl avoids `#[serde(skip)]`/computed fields would close this fully and let the findings collapse to Info.
 - **sigagg template-scan break semantics:** RESOLVED in Phase 2 (reasoned) — divergence is confined to mixed-type per-pubkey parSig sets, ruled out by consensus (one unsigned payload per duty); High downgraded to Low (comment + scan-semantics fix only).
+
+---
+## Delta audit 2026-07-02 — commits since 2026-06-30 baseline (#508)
+STATUS: VERIFIED (no Critical/High/Medium — Phase 2 not required)
+
+Scope: commit `c241b50`. In `parsigex_codec.rs`, #508 (a) hoists `looks_like_json` from a nested fn to a `pub(crate)` helper shared with `unsigneddata.rs`, and (b) reorders `deserialize_signed_data` for every SSZ-capable duty type to try SSZ first and only fall back to JSON when SSZ fails *and* the payload has a `{` prefix.
+
+### [Info] Prior "JSON-prefix-first" divergence is now FIXED — decode tries SSZ before JSON
+- **Rust:** `crates/core/src/parsigex_codec.rs:180` (`deserialize_signed_data`), `:176` (`looks_like_json`)
+- **Charon ref:** [`core/proto.go:287`](https://github.com/ObolNetwork/charon/blob/v1.7.1/core/proto.go#L287) (`unmarshal`: SSZ first, JSON only on SSZ failure with `{` prefix)
+- **Issue:** The existing Low in this dir's sibling (`core-types.md`: "`deserialize_signed_data` decides JSON-vs-SSZ by prefix first") is resolved by #508. All SSZ-capable branches (Attester, Proposer, Aggregator, SyncMessage, SyncContribution) now attempt SSZ decode first and only use the `{`-prefix as a JSON *fallback gate*, matching Charon's `unmarshal` exactly. Two new regression tests (`ssz_sync_message_with_leading_brace_decodes_as_ssz`, `ssz_signed_sync_contribution_with_leading_brace_decodes_as_ssz`) confirm SSZ payloads whose leading `u64` byte is `0x7B` are no longer misrouted to JSON. The per-type SSZ-then-JSON interleaving differs cosmetically from Charon's per-value `unmarshal` (pluto tries [phase0 SSZ, versioned SSZ] then [phase0 JSON, versioned JSON]; Charon tries [phase0 SSZ, phase0 JSON] then [versioned SSZ, versioned JSON]) but is behaviourally equivalent for the concrete eth2 types (no input is both valid-SSZ and JSON-prefixed for a given type). No new finding.
+- **Impact & likelihood:** Positive — removes a real (if low-probability) misroute of SSZ payloads beginning with `0x7B` · n/a.
+- **PoC:** n/a
+- **Fix:** None; change is correct. The prior Low can be considered closed.
+
+### Delta summary
+`parsigex_codec.rs` change is a net improvement: the SSZ-first reorder fixes the previously-recorded JSON-prefix-first Low and matches Charon's `unmarshal`, with regression coverage for leading-`0x7B` SSZ. No new parsig findings.

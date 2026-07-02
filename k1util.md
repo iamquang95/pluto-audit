@@ -8,12 +8,13 @@ Core sign/verify/recover logic is functionally close to charon and the shared te
 
 ## Findings
 
-### [High] Saved private key file is world/group-readable
+### [High] Saved private key file is world/group-readable — ✅ FIXED ([PR #507](https://github.com/NethermindEth/pluto/pull/507))
 - **Where:** crates/k1util/src/k1util.rs:202-208 (`save`)
 - **Charon ref:** [app/k1util/k1util.go:147](https://github.com/ObolNetwork/charon/blob/v1.7.1/app/k1util/k1util.go#L147) (`os.WriteFile(file, ..., 0o600)`)
 - **Issue:** `std::fs::write` creates the file with mode `0o666 & ~umask`, typically `0o644`, leaving the hex-encoded secp256k1 private key readable by group and other. Charon deliberately writes `0o600` (owner-only). This is the ENR/operator signing key at rest (saved via p2p key handling); on a multi-user host it is exposed.
 - **Verified:** PoC `poc_save_file_permissions` (added, run, deleted). Observed `saved key file mode = 644`; the `== 0o600` assertion FAILED (left 420 / right 384). Confirmed.
 - **Recommend:** Write with explicit owner-only perms on Unix: `OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(file)` then write hex; on non-Unix `fs::set_permissions` after write. Mirrors charon's `0o600`.
+- **Fix status ([PR #507](https://github.com/NethermindEth/pluto/pull/507)):** ✅ **Fixed.** `save` now creates the file via `OpenOptions...mode(0o600)` on Unix, and additionally `set_permissions(0o600)` to tighten an already-existing looser-perm file on overwrite (stricter than charon, whose `os.WriteFile` leaves existing perms untouched). Regression tests added: `save_writes_private_key_with_owner_only_permissions`, `save_tightens_permissions_when_overwriting_existing_file`. Minor gap vs. this Recommend: the `#[cfg(not(unix))]` branch still does a plain `fs::write` with no `set_permissions` (Unix mode bits are effectively meaningless on Windows, matching charon's effective behavior).
 
 ### [Medium] verify_64 rejects high-S signatures that charon accepts
 - **Where:** crates/k1util/src/k1util.rs:133-155 (`verify_64`)

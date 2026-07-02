@@ -71,3 +71,36 @@
 
 ## Summary
 parsigex is a faithful port of the wire format (protocol ID `/charon/parsigex/2.0.0`, unsigned-varint length-delimited framing matching go-msgio `pbio`, 128 MiB cap) and the validate→gate→verify→subscribe pipeline. The two material divergences are in broadcast semantics: pluto is synchronous, sends only to already-connected peers (no on-demand dial), and fails the broadcast on any peer error, whereas charon production fire-and-forgets via `SendAsync`, dials disconnected peers on demand, and retries relay errors — risking missed partial-sig delivery to transiently-disconnected peers and divergent failure handling. Minor: timeout defaults (20s vs 5s/7s) and shallower top-level proto nil-checking vs charon's recursive `protonil.Check`. Pluto's known-peer-only handler gating is a positive hardening; no crypto/`unsafe`/overflow issues found.
+
+---
+## Delta audit 2026-07-02 — commits since 2026-06-30 baseline (#511)
+STATUS: VERIFIED (no Critical/High/Medium — Phase 2 not required)
+
+Commit `8c6325c` adds `new_eth2_verifier` (behaviour.rs:62-91), the `VerifyError::InvalidSignature { duty, source }` variant (error.rs:60-69, replacing the old free-form `Other(String)`), re-export in lib.rs, and 4 tests. The verifier is a near line-for-line port of charon `NewEth2Verifier` (parsigex.go:150-175): same lookups, same order, same error strings, and it delegates the domain/epoch/BLS work to the already-audited core `verify_eth2_signed_data`. No Critical/High/Medium divergences found.
+
+### [Info] Verifier is a faithful, fail-closed port of `NewEth2Verifier` (positive)
+- **Rust:** `crates/parsigex/src/behaviour.rs:62` (`new_eth2_verifier`)
+- **Charon ref:** `core/parsigex/parsigex.go:150` (`NewEth2Verifier`)
+- **Issue:** Not a defect — recorded for parity coverage. Step order and rejection semantics match charon exactly: `pubShares[pubkey]` miss → `UnknownPubKey` ("unknown pubkey, not part of cluster lock"); `pubShares[share_idx]` miss → `InvalidShareIndex` ("invalid shareIdx"); non-eth2 `SignedData` (`as_eth2_signed_data` → `None`, mirroring Go's `data.(core.Eth2SignedData)` assertion) → `InvalidSignedDataFamily` ("invalid eth2 signed data") — i.e. an unsupported/raw signed-data family is **rejected (fail-closed)**, same as charon; verify failure → `InvalidSignature`. Direction parity also holds: verification runs on INBOUND sigs only (invoked per-entry in `handler.rs:262-265`, before `Received`/subscriber notification, so no unverified sig reaches parsigdb), and `Broadcast`/`handle_command` does not verify — identical to charon (`handle` verifies, `Broadcast` does not). Threshold/pubshare lookup keyed by the message's `share_idx` into `HashMap<u64,PublicKey>` matches `map[int]tbls.PublicKey`.
+- **Impact & likelihood:** None (correct behavior) · n/a
+- **PoC:** n/a
+- **Fix:** None.
+
+### [Info] `InvalidSignature` conflates transient beacon-node lookup failures with genuine BLS-verify failures (charon-parity, fail-closed)
+- **Rust:** `crates/parsigex/src/behaviour.rs:86` (`new_eth2_verifier`, `map_err(|source| VerifyError::InvalidSignature{..})`) via `core/eth2signeddata.rs:60` (`verify_eth2_signed_data`)
+- **Charon ref:** `core/eth2signeddata.go` (`VerifyEth2SignedData`) + `eth2util/signing/signing.go:107` (`Verify`→`GetDataRoot`); wrapped at `core/parsigex/parsigex.go:170`
+- **Issue:** `verify_eth2_signed_data` resolves the signing epoch (`epoch_from_slot`) and domain (`get_data_root`) via beacon-node API calls; a transient network/beacon error surfaces as `Eth2SignedDataError::{Helper,Signing}` and is folded into `InvalidSignature`, then flattened by `handler.rs:265` to `Failure::InvalidPartialSignature` — so a *valid* partial signature is rejected (and the whole inbound set dropped) on a transient beacon failure. Charon does the identical thing (`VerifyEth2SignedData` + `signing.Verify` both call `eth2Cl`; `handle` wraps as "invalid partial signature"), so this is parity-preserving and errs toward rejection (safe direction), not acceptance.
+- **Impact & likelihood:** A cluster peer's valid partial sig is discarded during a beacon-node blip, mildly hurting liveness; never accepts an invalid sig · only during beacon-node unavailability.
+- **PoC:** n/a
+- **Fix:** None required for parity. If desired beyond charon, distinguish infrastructure errors (retry/log) from cryptographic verify failures (reject) in `Eth2SignedDataError`; would be a core-crate change, not parsigex-local.
+
+### [Info] Doc comment says share is "the sending peer's public share" but selection is by the message's claimed `share_idx`, not the authenticated peer identity
+- **Rust:** `crates/parsigex/src/behaviour.rs:48-59` (`new_eth2_verifier` doc)
+- **Charon ref:** `core/parsigex/parsigex.go:69` (`handle` ignores sender `peer.ID`)
+- **Issue:** The pubshare is looked up by `par_signed_data.share_idx` carried in the message, not bound to the libp2p peer that sent it — so a cluster peer can relay another member's valid partial sig. Behavior matches charon (documented in the baseline `[Info]` peer-identity finding above); only the doc wording ("sending peer's public share") could mislead a reader into assuming peer-identity binding exists.
+- **Impact & likelihood:** Documentation-accuracy only; no behavioral divergence · n/a
+- **PoC:** n/a
+- **Fix:** Reword to "the share selected by the partial signature's `share_idx`" to avoid implying peer-identity binding.
+
+### Delta summary
+The #511 verifier is a clean, fail-closed 1:1 port of charon's `NewEth2Verifier` — matching lookup order, error strings, unsupported-type rejection, and inbound-only verification-before-storage. No Critical/High/Medium issues; the only notes are charon-parity error conflation (fail-closed, safe) and a minor doc-wording nit. Open integration item (not a delta defect): `new_eth2_verifier` is exported/tested but not yet wired into any production caller — the parsigex `Config`/`Behaviour` is not constructed in the `app` crate yet, so eth2 verification is not active in a running node until integration lands.

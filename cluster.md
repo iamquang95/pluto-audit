@@ -1,4 +1,18 @@
-# Audit: cluster  (6366 LOC) — STATUS: VERIFIED
+# Audit: cluster  (6366 LOC) — STATUS: RESOLVED ([PR #512](https://github.com/NethermindEth/pluto/pull/512))
+
+> **Resolution — [PR #512](https://github.com/NethermindEth/pluto/pull/512):** all correctness/interop findings fixed (1 High + 2 Medium + the one real Low). Remaining Lows/Infos are triaged won't-fix (representation-gap or can't-happen edge cases, or they already match charon); dead-code removal of `manifest/*` is deferred to a separate cleanup PR.
+>
+> | Finding | Sev | Status |
+> |---|---|---|
+> | `hash_lock_legacy` mixin uses wrong count | High | ✅ Fixed |
+> | v1.0–v1.5 distributed-validator fee recipient not rejected | Med | ✅ Fixed |
+> | v1.0/v1.1 non-zero operator nonce not rejected | Med | ✅ Fixed |
+> | legacy timestamp gating mis-parenthesized | Low | ✅ Fixed |
+> | builder-reg "noRegistration" omits fee-recipient | Low | Won't-fix |
+> | registration negative Unix time errors vs wraps | Low | Won't-fix |
+> | `Definition::new` timestamp format | Low | Won't-fix |
+> | `get_operator_eip712_type` `unreachable!` | Info | Won't-fix |
+> | `manifest/*` retained (removed upstream) | Info | Deferred |
 
 - **Pluto:** `crates/cluster/src/*` (definition, lock, manifest/, operator, deposit, distvalidator, eip712sigs, registration, ssz, version)
 - **Charon:** `cluster/*.go` (definition, lock, operator, deposit, distvalidator, eip712sigs, registration, ssz, version, helpers)
@@ -28,6 +42,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Interop-critical — wrong `lock_hash` for v1.0/v1.1/v1.2 locks silently breaks cluster formation / lock verification across charon↔pluto · latent: only when `definition.validator_addresses.len() != distributed_validators.len()` (malformed or hand-edited legacy lock, or any future caller that builds a Lock with mismatched counts). Always semantically wrong field even when count happens to match.
 - **PoC:** CONFIRMED — scratch test `hash_lock_legacy` on a v1.2 Lock with `validator_addresses.len()=3` but `distributed_validators.len()=2` produced `0x509f0577…` vs a charon-faithful reference (mixin = `distributed_validators.len()`) `0x61896210…` → hashes diverge. Wrong field confirmed; `Deref` resolves `lock.validator_addresses` to `definition.validator_addresses`. (Note: also triggers `CountGreaterThanLimit` errors when `validator_addresses.len() < distributed_validators.len()`, since `merkleize_with_mixin(num,num)` uses the wrong count as the limit.)
 - **Fix:** Use `let num = lock.distributed_validators.len();` to match charon.
+- **Resolution:** ✅ Fixed in [PR #512](https://github.com/NethermindEth/pluto/pull/512) — now uses `lock.distributed_validators.len()`. Regression test: `legacy_lock_hash_uses_distributed_validator_count`.
 
 ### [Low] Legacy config-hash timestamp gating mis-parenthesized vs charon (functionally inert)
 - **Rust:** `crates/cluster/src/ssz.rs:239` (`hash_definition_legacy`)
@@ -36,6 +51,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** **No observable hash divergence** (see PoC). The diverging case only puts an *empty* timestamp string, which the SSZ hasher encodes as one all-zero 32-byte chunk appended immediately before the final `merkleize(indx)`; that trailing zero chunk is absorbed by the tree's zero-padding, so the config hash is identical whether or not it is written. Pure code-clarity/correctness divergence with zero interop impact; cannot cascade into `definition_hash`/EIP-712 digests. **Severity lowered High → Low** based on PoC.
 - **PoC:** REFUTED (as an observable bug) — scratch test: v1.2 def, empty timestamp, `config_only=true`. Pluto config hash `0x5290619a…` == charon-faithful reference that skips the timestamp field entirely `0x5290619a…`. Positive control (non-empty timestamp `0x5394f10f…` ≠ empty) confirms the harness detects real timestamp changes; re-verified with a 3-operator definition (`0x9a9bcd30…` == reference). The empty/zero trailing field is absorbed by merkleization zero-padding. (Go branch reasoned, not run.)
 - **Fix:** Mirror Go's branch structure explicitly for clarity/future-proofing: `if config_only { if !timestamp.is_empty() { put } } else if version != V1_0 { put }`. Not interop-blocking.
+- **Resolution:** ✅ Fixed in [PR #512](https://github.com/NethermindEth/pluto/pull/512) — rewrote to charon's nested branch structure. No behavior change (empty write is a no-op); covered by existing golden config/definition-hash tests.
 
 ### [Medium] v1.0–v1.5 lock deserialization drops "distributed validator fee recipient not supported" rejection
 - **Rust:** `crates/cluster/src/lock.rs:460` (`From<LockV1x0or1> for Lock`), `:515` (`From<LockV1x2to5> for Lock`); `crates/cluster/src/distvalidator.rs:168,211` (`From<DistValidatorV1x0or1/V1x2to5> for DistValidator`)
@@ -44,6 +60,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Pluto accepts legacy locks charon rejects; the dropped field is excluded from the lock hash so verification can still pass, masking malformed/legacy data instead of surfacing it · only on legacy locks that actually carry the deprecated field.
 - **PoC:** confirmed by inspection (no PoC needed) — `From<DistValidatorV1x0or1>` (distvalidator.rs:168) and `From<DistValidatorV1x2to5>` (:211) build `DistValidator` from `pub_key`/`pub_shares` only; the deserialized `fee_recipient_address` field is never read (no rejection). Charon `unmarshalLockV1x0or1`/`unmarshalLockV1x2to5` (lock.go:365-369, 387-391) explicitly `return … "distributed validator fee recipient not supported anymore"` when `len(FeeRecipientAddress) > 0`. (Go reasoned, not run.)
 - **Fix:** In the v1x0or1 / v1x2to5 `From` conversions (or a dedicated deserialize path) return an error when any `fee_recipient_address` is non-empty, matching charon.
+- **Resolution:** ✅ Fixed in [PR #512](https://github.com/NethermindEth/pluto/pull/512) — `Lock::deserialize` rejects a non-empty `distributed_validators[*].fee_recipient_address` in the v1.0/v1.1 and v1.2–v1.5 branches. Test: `legacy_lock_rejects_distributed_validator_fee_recipient`.
 
 ### [Medium] OperatorV1X1 non-zero nonce not rejected on deserialization
 - **Rust:** `crates/cluster/src/operator.rs:61` (`From<OperatorV1X1> for Operator`)
@@ -52,6 +69,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Pluto silently accepts malformed legacy operator records charon rejects (validation/parity gap); no hash impact since the SSZ path always writes `ZERO_NONCE` · only on hand-crafted/legacy input with non-zero nonce.
 - **PoC:** confirmed by inspection (no PoC needed) — `From<OperatorV1X1> for Operator` (operator.rs:61-69) copies `address`/`enr`/`config_signature`/`enr_signature` and never reads the deserialized `nonce: u64` field, so any value is accepted. Charon `operatorsFromV1x1` (operator.go:47-64) returns `"non-zero operator nonce not supported"` when `o.Nonce != 0`. (Go reasoned, not run.)
 - **Fix:** Reject `nonce != 0` in `From<OperatorV1X1>`/deserialization (convert to a fallible path), matching charon.
+- **Resolution:** ✅ Fixed in [PR #512](https://github.com/NethermindEth/pluto/pull/512) — made the conversion fallible (`TryFrom<OperatorV1X1> for Operator`), returning new `DefinitionError::NonZeroOperatorNonce`. Test: `v1x0or1_definition_rejects_non_zero_operator_nonce`.
 
 ### [Low] verifyBuilderRegistrations "noRegistration" check omits fee-recipient emptiness test
 - **Rust:** `crates/cluster/src/lock.rs:364` (`verify_builder_registrations`)
@@ -60,6 +78,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Behavioral divergence only for the unusual case of a partially-populated registration; for fully-present or fully-absent registrations the two agree · negligibly rare in practice.
 - **PoC:** n/a
 - **Fix:** Document the deliberate divergence, or normalize to Go semantics by also treating a zero/absent fee recipient as "no registration" when sig+pubkey are also zero.
+- **Resolution:** Won't-fix ([PR #512](https://github.com/NethermindEth/pluto/pull/512)) — exact parity needs `Option`-typing (fixed `[u8;N]` can't express Go's `len==0`); only diverges for a malformed partial registration that never occurs in real locks, and only affects the accept/reject check, not the hash. Divergence already documented inline.
 
 ### [Low] Registration timestamp SSZ encoding errors on negative Unix time instead of wrapping
 - **Rust:** `crates/cluster/src/ssz.rs:949-953` (`hash_registration`); also `lock.rs:390-395`, `distvalidator.rs:121-126`
@@ -68,6 +87,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Different behavior (error vs hash) only for pre-1970 registration timestamps, which never occur for real builder registrations · negligibly rare.
 - **PoC:** n/a
 - **Fix:** If strict parity is desired, use `as u64` cast (wrapping) to mirror Go; otherwise document the stricter behavior.
+- **Resolution:** Won't-fix ([PR #512](https://github.com/NethermindEth/pluto/pull/512)) — differs only for pre-1970 timestamps (impossible for real builder registrations); pluto's error is a preferable transparent failure over Go's silent wrap.
 
 ### [Low] NewDefinition timestamp format differs from charon
 - **Rust:** `crates/cluster/src/definition.rs:446-449` (`Definition::new`)
@@ -76,6 +96,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** No divergence found between the two for second-precision local RFC3339; risk is future drift (e.g. tz/offset formatting) · n/a at present.
 - **PoC:** n/a
 - **Fix:** None required now; consider a single controlled UTC RFC3339 helper to remove the risk (matches the existing TODO).
+- **Resolution:** Won't-fix ([PR #512](https://github.com/NethermindEth/pluto/pull/512)) — no divergence found; the existing `TODO` already tracks the future-drift risk.
 
 ### [Info] get_operator_eip712_type panics via unreachable! on unsupported version
 - **Rust:** `crates/cluster/src/eip712sigs.rs:121` (`get_operator_eip712_type`)
@@ -84,6 +105,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Matches charon; only reachable via a future caller that bypasses the version gate · effectively never.
 - **PoC:** n/a
 - **Fix:** Optional: return `Result`/typed error instead of panicking to harden against future misuse.
+- **Resolution:** Won't-fix ([PR #512](https://github.com/NethermindEth/pluto/pull/512)) — matches charon (both panic) and the path is gated by `support_eip712_sigs`, so it is unreachable by construction.
 
 ### [Info] manifest/* modules retained though removed upstream
 - **Rust:** `crates/cluster/src/manifest/mod.rs:1-32`
@@ -92,6 +114,7 @@ Core config/lock hashing (v1.3–v1.10), EIP-712 digests, operator/creator signa
 - **Impact & likelihood:** Maintenance/clarity only; extra attack/parity surface with no production use · n/a.
 - **PoC:** n/a
 - **Fix:** Remove the obsolete manifest modules (or gate behind a feature) if they are truly unused.
+- **Resolution:** Deferred ([PR #512](https://github.com/NethermindEth/pluto/pull/512)) — verified unused workspace-wide (only a doc-comment reference in `eth2util/keystore/store.rs`; the two "keystore fns" have zero callers). Removal is a large destructive change (11 `.rs` files + `manifestpb` protobuf + `build.rs` step + `lib.rs` decls) → separate cleanup PR.
 
 ## Uncertain / needs-human
 - **`verify_aggregate` with empty pubkeys (lock.rs:285-294):** for a v1.x lock with zero distributed validators but a non-empty `signature_aggregate`, `pubkeys` is empty. Go's `tbls.VerifyAggregate` vs pluto's `BlstImpl.verify_aggregate` behavior on an empty pubkey set is library-dependent (may error, may treat as identity). Not validated; needs checking against the blst wrapper. Likely benign (zero-validator locks are degenerate) but unverified.

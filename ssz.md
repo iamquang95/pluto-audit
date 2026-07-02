@@ -1,9 +1,18 @@
-# Audit: ssz  (1686 LOC) — STATUS: VERIFIED
+# Audit: ssz  (1686 LOC) — STATUS: VERIFIED · REMEDIATED
 
 - **Pluto:** `crates/ssz/src/*` (encode, decode, hasher, helpers, types, serde_utils, error)
 - **Charon:** `app/genssz` + prysm/fastssz (charon delegates SSZ to fastssz)
 - **Tier A** · model: **opus** · READ-ONLY (no source edits, no builds)
 - **How to run:** use the agent prompt + output schema in `shared/audit/README.md`; overall process in `.plans/repo-audit.md`.
+
+## Remediation (branch `feat/fix-audit-ssz`, PR [#513](https://github.com/NethermindEth/pluto/pull/513))
+All defects (#1–#6) fixed; #7 reverted as WON'T FIX (output was always correct). Commits:
+- `d9b6ef9` — [High] BitList `MAX` cap (fallible decoder) → resolves #1
+- `6036aa0` — [Medium] reject bitlist encodings missing the sentinel bit → resolves #2
+- `b687a28` — [Low] reject non-zero `BitVector` padding bits → resolves #3
+- `2d16e4d` — [Low] guard `default_hash_fn`/`with_bits`, mandatory `SszList` `MAX` → resolves #4, #5, #6
+
+**Still open (not a code fix):** Phase-2 fastssz spec-vector parity (see Uncertain).
 
 ## Module map (pluto ↔ charon)
 - `encode.rs`/`decode.rs` ↔ SSZ ser/de
@@ -28,6 +37,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 ---
 
 ### [High] `BitList::from_ssz_bytes` ignores `MAX`; over-capacity bitlists silently accepted
+- **Status:** ✅ FIXED — `d9b6ef9`. Inherent `BitList::from_ssz_bytes` now returns `Result` and rejects `len > MAX` (when `MAX > 0`); the untrusted path (eth2api `try_from`) uses the inherent decoder, so the check lives there. eth2api `phase0`/`electra` + core inclusion tracker call sites updated to propagate. Regression test `bitlist_from_ssz_rejects_over_capacity`.
 - **Rust:** `crates/ssz/src/types.rs:451` (`impl Decode for BitList::from_ssz_bytes`) → delegates to inherent `from_ssz_bytes` at `types.rs:304`
 - **Charon ref:** fastssz `UnmarshalSSZ`/`ValidateBitlist` + SSZ spec (Bitlist[N] decode MUST reject `bit_count > N`) | n/a (Rust-only laxity)
 - **Issue:** The `Decode` impl returns `Ok(Self::from_ssz_bytes(bytes.to_vec()))` and the inherent decoder never consults the `MAX` const generic. A bitlist whose decoded bit-length exceeds `MAX` (e.g. an `aggregation_bits` longer than `BitList<2048>` / `BitList<131_072>`) decodes successfully with `len > MAX`. fastssz and `ssz_types` reject this. The repo even ships `ELECTRA_OVERSIZED_ATTESTATION_JSON` (`crates/eth2api/src/test_fixtures.rs:60`, ~2056 bits into `BitList<2048>`) as an over-capacity case, but the decoder cannot reject it because the inherent `from_ssz_bytes` is infallible (returns `Self`, not `Result`).
@@ -36,6 +46,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** Make the inherent decoder fallible (or add validation in the `Decode` impl): after computing `len`, return `DecodeError::BytesInvalid` when `MAX > 0 && len > MAX`. Mirror `SszList`'s `MAX` check (`types.rs:105`).
 
 ### [Low] `BitVector::from_ssz_bytes` does not reject non-zero padding bits
+- **Status:** ✅ FIXED — `b687a28`. Added `BitVector::padding_is_zero` and applied it in **both** decode entry points (`Decode` impl + serde `Deserialize`); no-op for byte-aligned `SIZE` (all live vectors: 64/128/512). Regression test `bitvector_from_ssz_rejects_nonzero_padding` (`BitVector<12>`).
 - **Rust:** `crates/ssz/src/types.rs:580` (`impl Decode for BitVector::from_ssz_bytes`)
 - **Charon ref:** fastssz bitvector unmarshal + SSZ spec (Bitvector[N]: bits above index `N` MUST be zero) | n/a
 - **Issue:** Decode checks only total byte length (`SIZE.div_ceil(8)`); it does not verify that the unused high bits of the final byte (positions `SIZE .. 8*ceil(SIZE/8)`) are zero. `tree_hash_root` (`types.rs:607`) hashes `self.bytes` verbatim, so attacker-set padding bits flow straight into the root, while `bit_indices`/`bit_at` (which clamp to `< SIZE`) ignore them — i.e. the corruption is invisible to logic but present in the hash.
@@ -44,6 +55,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** After the length check, when `SIZE % 8 != 0`, reject if `bytes.last() & !((1 << (SIZE % 8)) - 1) != 0` with `DecodeError::BytesInvalid`.
 
 ### [Medium] `BitList::from_ssz_bytes` silently maps malformed (zero-sentinel) input to empty instead of erroring
+- **Status:** ✅ FIXED — `6036aa0`. Empty buffer and zero final byte now return `DecodeError::BytesInvalid` (resolved together with #1's fallible-decoder change); the canonical empty bitlist `0x01` still decodes to len 0. Regression test `bitlist_from_ssz_rejects_missing_sentinel`.
 - **Rust:** `crates/ssz/src/types.rs:304-329` (`BitList::from_ssz_bytes`, branch `last_byte == 0` and empty `ssz`)
 - **Charon ref:** fastssz `ValidateBitlist` + SSZ spec (a valid Bitlist encoding always has a non-zero final byte; an all-zero trailing byte / empty buffer is invalid) | n/a
 - **Issue:** Empty input and a zero last byte both return `Self::default()` (len 0) rather than signalling a decode error. A valid bitlist of length 0 encodes as `0x01` (sentinel only), never `0x00` or `""`. Combined with the infallible signature, malformed encodings are accepted as "empty".
@@ -52,6 +64,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** Return a `Result`; error on empty buffer or zero final byte (consistent with the MAX-cap fix above — converting this decoder to fallible resolves both at once).
 
 ### [Low] `default_hash_fn` panics on input not a multiple of 64 bytes
+- **Status:** ✅ FIXED — `2d16e4d`. Returns `HasherError::InvalidBufferLength` when `len` is not a multiple of 64 (covers both the <32 panic and the 32..63 silent mis-hash); precondition documented. Regression test `default_hash_fn_rejects_non_multiple_of_64`.
 - **Rust:** `crates/ssz/src/hasher.rs:133-144` (`Hasher::default_hash_fn`)
 - **Charon ref:** fastssz `hasher.go` `hashFn`/`gohashtree` always receives padded even-chunk input | n/a (internal invariant)
 - **Issue:** `for pair in src.chunks(64) { hasher.update(&pair[..32]); hasher.update(&pair[32..]); }` indexes `pair[..32]` and `pair[32..]` assuming every chunk is exactly 64 bytes. A final chunk of 1..63 bytes panics (`pair[..32]` slice OOB for <32, or empty second half mis-hashes for 32..63). All current callers (`merkleize_impl` after odd-node padding) supply multiples of 64, so it is not reachable today, but the function is `pub` and undocumented about this precondition.
@@ -60,6 +73,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** Document the "len must be a multiple of 64" invariant, or `return Err(InvalidBufferLength)` when `src.len() % 64 != 0`.
 
 ### [Low] `SszList<T, 0>` (default `MAX`) merkleizes without capacity padding → non-spec root
+- **Status:** ✅ FIXED — `2d16e4d`. Dropped the `const MAX: usize = 0` default so `MAX` is mandatory (matches `SszVector`), removing the footgun of an accidental capacity-less root via bare `SszList<T>`. No code relied on the default; explicit `SszList<T, 0>` (the degenerate `List[T,0]`) still compiles.
 - **Rust:** `crates/ssz/src/types.rs:130-138` (`SszList::tree_hash_root`, `MAX == 0` branch sets `minimum_leaf_count = 0`)
 - **Charon ref:** SSZ spec (a List[T, N] always merkleizes the data padded to `chunk_count(N)` then `mix_in_length`) | n/a
 - **Issue:** When `MAX == 0` the root depends only on the actual element count, not on the declared list capacity, so it does not match a spec/fastssz root for any concrete `N`. This is the `Default` and is the value used by `SszList<T>` written without an explicit const generic.
@@ -68,6 +82,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** Make `MAX` mandatory (drop the `= 0` default), or document that `MAX = 0` means "no capacity" and is not spec-compliant for hashing.
 
 ### [Low] `BitList::with_bits` / `BitVector::with_bits` panic on out-of-range bit index
+- **Status:** ✅ FIXED — `2d16e4d`. Both `with_bits` now `assert!(bit < capacity)` / `assert!(bit < SIZE)` with an actionable message (replacing the opaque index-OOB panic) and document the precondition under `# Panics`. Kept as assert, not `Result` — it is a caller-contract precondition all in-tree callers satisfy. `#[should_panic]` tests added.
 - **Rust:** `crates/ssz/src/types.rs:348-350` (`BitList::with_bits`), `types.rs:500-503` (`BitVector::with_bits`), also `set_bit_at`/`bit_at` rely on `BIT_MASK[i % 8]` which is fine but `bytes[bit / 8]` is unchecked in `with_bits`
 - **Charon ref:** n/a (Rust-only API)
 - **Issue:** `with_bits(capacity, set_bits)` indexes `bytes[bit / 8]` without checking `bit < capacity`; a `set_bits` entry ≥ `capacity` panics (index OOB). `BitVector::with_bits` similarly trusts `bit < SIZE`. All in-tree callers pass controlled indices, so not reachable from untrusted input, but it is a `pub` constructor with an unstated precondition.
@@ -76,6 +91,7 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** Either document the precondition or return `Result`/skip out-of-range bits; assert `bit < capacity`/`bit < SIZE`.
 
 ### [Low] `merkleize_with_mixin` performs a redundant truncate/extend before computing the mixin
+- **Status:** ⏹️ WON'T FIX — output was always correct; the redundant copy is a micro-nit on a non-hot path. A fix was applied then reverted as out of scope for a correctness audit.
 - **Rust:** `crates/ssz/src/hasher.rs:370-382` (`Hasher::merkleize_with_mixin`)
 - **Charon ref:** fastssz `hasher.go` `MerkleizeWithMixin` | confirmed equivalent output
 - **Issue:** The function writes the intermediate merkle root into `self.buf` (`truncate(index); extend_from_slice(&input)` at lines 370-371) and then immediately overwrites it again (lines 381-382) after appending the length chunk and hashing. The first write is dead work. Output is correct; only an efficiency/clarity nit on a hot signing path.
@@ -100,9 +116,11 @@ The findings below weight (1) the manual hasher's fastssz parity and (2) the cus
 - **Fix:** none
 
 ## Uncertain / needs-human
-- **fastssz source not on disk** (`go env GOPATH` cache empty; no vendored `ferranbt/fastssz`). The `hasher.rs` merkleization (`merkleize_impl`, `get_depth`/`next_power_of_two`, `MerkleizeWithMixin`, `calculate_limit`, `parse_bitlist`) was reviewed against the SSZ spec and recalled fastssz behavior and judged equivalent, but was **not** diffed line-by-line against pinned fastssz. Recommend a Phase-2 spec-vector test (official SSZ test vectors / cross-check against fastssz output for representative containers) to lock parity. Specifically confirm: `merkleize_impl` `limit==1`/empty-input ordering, `get_depth(limit)` for large limits, and the length-chunk layout in `merkleize_with_mixin`.
+- **fastssz source not on disk** (`go env GOPATH` cache empty; no vendored `ferranbt/fastssz`). ⚠️ **STILL OPEN after PR #513** (not addressed by remediation). The `hasher.rs` merkleization (`merkleize_impl`, `get_depth`/`next_power_of_two`, `MerkleizeWithMixin`, `calculate_limit`, `parse_bitlist`) was reviewed against the SSZ spec and recalled fastssz behavior and judged equivalent, but was **not** diffed line-by-line against pinned fastssz. Partial coverage exists via the eth2api tree-hash vector tests (`tree_hash_matches_vector`), but recommend a Phase-2 spec-vector test (official SSZ test vectors / cross-check against fastssz output for representative containers) to lock parity. Specifically confirm: `merkleize_impl` `limit==1`/empty-input ordering, `get_depth(limit)` for large limits, and the length-chunk layout in `merkleize_with_mixin`.
 - **`ethereum_ssz` 0.10 `Vec<T>::from_ssz_bytes` offset/length bounds** (used by `SszList::from_ssz_bytes`) are upstream-crate responsibility and out of this unit's scope; assumed sound. The wrapper's added `MAX` post-check is correct; the untrusted-decode risk inside this crate is the `BitList`/`BitVector` findings above.
 - **Whether the over-capacity `aggregation_bits` is rejected somewhere downstream** of `BitList::from_ssz_bytes` (e.g. a later validation in `eth2api`/`core`) — RESOLVED in Phase 2: no downstream cap exists. The only consumer is `decode_hex_var` → infallible `BitList::from_ssz_bytes` (`electra.rs:106`, `phase0.rs:414`); grep found no length check on `aggregation_bits` anywhere in `eth2api`/`core`. The `electra_oversized_attestation_json` fixture's test (`electra.rs:404`) *expects* successful decode with `len() > 2048`. [High] finding stands at High.
 
 ## Summary
 Two SSZ stacks coexist: a manual fastssz-port hasher (cluster/QBFT signing roots) and custom `BitList`/`BitVector`/`SszList` wrappers over `ethereum_ssz`+`tree_hash` (attestation/block roots, decoded from untrusted beacon-node JSON). The hasher and `helpers.rs` match charon `genssz`/fastssz on inspection; main risk is in the custom bitfield decoders. Top issue: `BitList::from_ssz_bytes` ignores its `MAX` const generic and is infallible, so over-capacity attacker-supplied `aggregation_bits` decode silently and corrupt the tree-hash signing root (High). One related Medium decode-laxity issue remains: `BitList` coerces malformed zero-sentinel input to "empty". `BitVector` padding validation is Low after triage because current live vectors are byte-aligned. Remaining items are Low/Info (latent panics on `pub` APIs, a non-spec `MAX==0` default root, a redundant copy in the mixin path). fastssz was not on disk — merkleization parity is reasoned, not vector-tested; flagged for Phase 2.
+
+**Remediation status (PR [#513](https://github.com/NethermindEth/pluto/pull/513), branch `feat/fix-audit-ssz`):** all defects #1–#6 fixed with regression tests (`d9b6ef9`, `6036aa0`, `b687a28`, `2d16e4d`); #7 reverted as WON'T FIX (output was always correct). The only outstanding item is the Phase-2 fastssz spec-vector parity test — still open.

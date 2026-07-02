@@ -28,6 +28,8 @@ points 48-byte compressed G1; Shamir share x-coordinate = 1-indexed `id`; thresh
 limit≤255, limit≥threshold; group VK = Σ A_{i,0}, VkShare = G·sk_total. RFC 9380 vectors
 for `expand_msg_xmd` pass. Findings below are the divergences/issues found.
 
+> **Note — [PR #507](https://github.com/NethermindEth/pluto/pull/507) (secret-hardening):** This PR added, in the frost crate, explicit `Zeroize::zeroize` of the secret scalars in `kryptology::round1`/`round2` (nonce `k`, per-peer share scalars, reconstructed signing key) and redacting manual `Debug` impls for `SigningShare`, `KeyPackage`, and `ShamirShare` (dropping their derived `Debug` so secret bytes can't leak via logs/panics). This was **not** a finding in this file — the scan flagged no zeroize/Debug-leak issue in frost — so it is proactive hardening, not a remediation of a tracked item. Zeroization here is best-effort (`Scalar: Copy`, so blst arithmetic intermediates aren't wiped), as documented in `curve.rs`.
+
 ### [Low] round2: bcast upper-bound stricter than kryptology (rejects len == max_signers)
 - **Rust:** `crates/frost/src/kryptology.rs:397-405` (`round2`)
 - **Charon ref:** kryptology `pkg/dkg/frost/dkg_round2.go` Round2 length guard (`if uint32(len(bcast)) > dp.feldman.Limit || ... < Threshold-1`) | charon `dkg/frost.go` n/a (delegates to lib)
